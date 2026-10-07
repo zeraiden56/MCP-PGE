@@ -1,0 +1,519 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative '../boot'
+
+module Juridico
+  module SmokeAllTribunais
+    ERROR_CODES = %w[
+      invalid_cnj
+      unsupported_tribunal
+      unsupported_capability
+      not_found
+      incomplete_response
+      upstream_timeout
+      upstream_http_error
+      upstream_tls_error
+      missing_credentials
+      configuration_error
+      database_error
+      rate_limited
+      sync_busy
+      non_public_record
+      invalid_response
+      invalid_endpoint
+      internal_error
+    ].freeze
+
+    EXPECTED_NON_FATAL_CODES = %w[
+      unsupported_tribunal
+      unsupported_capability
+    ].freeze
+
+    COLUMNS = %i[
+      tribunal
+      numero_cnj
+      status
+      code
+      fonte
+      cache
+      consultado_em
+      processos_encontrados
+      movimentacoes_encontradas
+      duracao_segundos
+    ].freeze
+
+    def self.run(argv, env: ENV, out: $stdout, err: $stderr)
+      tribunais =
+        Tribunais::TribunalResolver::ORIGENS
+          .values
+          .uniq
+
+      inputs =
+        tribunais.to_h do |tribunal|
+          [
+            tribunal,
+            env.fetch("#{tribunal}_CNJ", '').strip
+          ]
+        end
+
+      #
+      # Argumentos passados na linha de comando
+      # prevalecem sobre variáveis de ambiente.
+      #
+      # Exemplo:
+      #
+      # bundle exec ruby bin/smoke_all_tribunais \
+      #   TJMT_CNJ='1011927-78.2016.8.11.0041'
+      #
+      argv.each do |argument|
+        name, value =
+          argument.split('=', 2)
+
+        name =
+          name
+            .to_s
+            .delete_suffix('_CNJ')
+
+        unless valid_argument?(
+          tribunais,
+          name,
+          value
+        )
+          print_usage(
+            err,
+            tribunais
+          )
+
+          return 2
+        end
+
+        inputs[name] =
+          value.strip
+      end
+
+      #
+      # Nenhum CNJ informado.
+      #
+      if inputs.values.all?(&:empty?)
+        print_usage(
+          err,
+          tribunais
+        )
+
+        return 2
+      end
+
+      repository = nil
+      service = nil
+      build_error = nil
+
+      begin
+        service, repository =
+          Juridico.build_service
+      rescue StandardError => error
+        build_error =
+          safe_code(error)
+      end
+
+      rows =
+        inputs.map do |tribunal, input|
+          execute_row(
+            tribunal: tribunal,
+            input: input,
+            service: service,
+            build_error: build_error
+          )
+        end
+
+      print_table(
+        rows,
+        out
+      )
+
+      #
+      # Exit codes:
+      #
+      # 0 = execução válida:
+      #     ok / skipped / unsupported
+      #
+      # 1 = pelo menos um erro real
+      #
+      # 2 = uso inválido / nenhum CNJ
+      #
+      fatal_error =
+        rows.any? do |row|
+          row[:status] == 'error'
+        end
+
+      fatal_error ? 1 : 0
+
+    ensure
+      begin
+        repository&.close
+      rescue StandardError
+        err.puts(
+          'Falha ao fechar conexão PostgreSQL; detalhes omitidos.'
+        )
+
+        return 1
+      end
+    end
+
+    def self.execute_row(
+      tribunal:,
+      input:,
+      service:,
+      build_error:
+    )
+      started =
+        Process.clock_gettime(
+          Process::CLOCK_MONOTONIC
+        )
+
+      row =
+        COLUMNS
+          .to_h do |column|
+            [column, nil]
+          end
+          .merge(
+            tribunal: tribunal
+          )
+
+      begin
+        #
+        # Tribunal presente no resolver,
+        # mas sem CNJ fornecido neste teste.
+        #
+        if input.empty?
+          row.merge!(
+            status: 'skipped',
+            code: 'missing_cnj'
+          )
+
+          return row
+        end
+
+        #
+        # Só mostramos o CNJ depois de
+        # validá-lo e formatá-lo.
+        #
+        cnj =
+          Tribunais::CNJ.new(
+            input
+          )
+
+        row[:numero_cnj] =
+          cnj.formatado
+
+        #
+        # Falha na composição do serviço.
+        #
+        if build_error
+          row.merge!(
+            status: 'error',
+            code: build_error
+          )
+
+          return row
+        end
+
+        #
+        # Resolve origem do CNJ.
+        #
+        resolution =
+          service
+            .resolver
+            .resolve(input)
+
+        #
+        # Proteção para garantir que o CNJ
+        # realmente pertence à linha da matriz.
+        #
+        if resolution.tribunal != tribunal
+          row.merge!(
+            status: 'error',
+            code: 'tribunal_mismatch'
+          )
+
+          return row
+        end
+
+        row[:fonte] =
+          safe_source(
+            resolution
+          )
+
+        #
+        # Reutiliza exatamente o mesmo fluxo
+        # usado pelo MCP.
+        #
+        payload =
+          service.call(
+            ferramenta: 'buscar_processo',
+            numero_cnj: input
+          )
+
+        processes =
+          Array(
+            payload['processos']
+          )
+
+        row.merge!(
+          status:
+            payload.fetch(
+              'status',
+              'ok'
+            ),
+
+          fonte:
+            payload.dig(
+              'capacidades',
+              'fonte'
+            ) ||
+            row[:fonte],
+
+          cache:
+            payload['cache'],
+
+          consultado_em:
+            payload[
+              'consultado_em'
+            ],
+
+          processos_encontrados:
+            processes.size,
+
+          movimentacoes_encontradas:
+            processes.sum do |process|
+              Array(
+                process[
+                  'movimentacoes'
+                ]
+              ).size
+            end
+        )
+
+      rescue StandardError => error
+        code =
+          safe_code(error)
+
+        row.merge!(
+          status:
+            status_for_error(
+              code
+            ),
+          code: code
+        )
+
+      ensure
+        row[:duracao_segundos] =
+          (
+            Process.clock_gettime(
+              Process::CLOCK_MONOTONIC
+            ) - started
+          ).round(3)
+      end
+
+      row
+    end
+
+    def self.valid_argument?(
+      tribunais,
+      name,
+      value
+    )
+      tribunais.include?(name) &&
+        value &&
+        !value.strip.empty?
+    end
+
+    def self.safe_source(
+      resolution
+    )
+      capabilities =
+        resolution
+          .client
+          .capabilities
+
+      capabilities['fonte'] ||
+        capabilities[:fonte]
+
+    rescue StandardError
+      nil
+    end
+
+    def self.safe_code(
+      error
+    )
+      if error.is_a?(
+        Juridico::Error
+      ) &&
+         ERROR_CODES.include?(
+           error.code
+         )
+        error.code
+      else
+        'internal_error'
+      end
+    end
+
+    #
+    # Estados conhecidos que não representam
+    # falha operacional do smoke test.
+    #
+    def self.status_for_error(
+      code
+    )
+      if EXPECTED_NON_FATAL_CODES.include?(
+        code
+      )
+        'unsupported'
+      else
+        'error'
+      end
+    end
+
+    def self.print_usage(
+      err,
+      tribunais
+    )
+      arguments =
+        tribunais.map do |tribunal|
+          "#{tribunal}_CNJ=NUMERO"
+        end
+
+      err.puts(
+        'Uso:'
+      )
+
+      err.puts(
+        "  bundle exec ruby bin/smoke_all_tribunais #{arguments.join(' ')}"
+      )
+
+      err.puts
+
+      err.puts(
+        'Exemplo:'
+      )
+
+      err.puts(
+        "  bundle exec ruby bin/smoke_all_tribunais \\"
+      )
+
+      tribunais.each_with_index do |tribunal, index|
+        suffix =
+          index == tribunais.length - 1 ? '' : ' \\'
+
+        err.puts(
+          "    #{tribunal}_CNJ='NUMERO'#{suffix}"
+        )
+      end
+
+      err.puts
+
+      err.puts(
+        'Também é possível fornecer os CNJs por variáveis de ambiente.'
+      )
+    end
+
+    def self.print_table(
+      rows,
+      out
+    )
+      cells =
+        [
+          COLUMNS.map(&:to_s)
+        ] +
+        rows.map do |row|
+          COLUMNS.map do |column|
+            value =
+              row[column]
+
+            if value.nil?
+              '-'
+            else
+              sanitize_cell(
+                value
+              )
+            end
+          end
+        end
+
+      widths =
+        COLUMNS
+          .each_index
+          .map do |index|
+            cells
+              .map do |row|
+                row[index].length
+              end
+              .max
+          end
+
+      #
+      # Cabeçalho
+      #
+      out.puts(
+        cells
+          .first
+          .each_with_index
+          .map do |cell, index|
+            cell.ljust(
+              widths[index]
+            )
+          end
+          .join(' | ')
+      )
+
+      #
+      # Separador
+      #
+      out.puts(
+        widths
+          .map do |width|
+            '-' * width
+          end
+          .join('-+-')
+      )
+
+      #
+      # Dados
+      #
+      cells
+        .drop(1)
+        .each do |row|
+          out.puts(
+            row
+              .each_with_index
+              .map do |cell, index|
+                cell.ljust(
+                  widths[index]
+                )
+              end
+              .join(' | ')
+          )
+        end
+    end
+
+    def self.sanitize_cell(
+      value
+    )
+      value
+        .to_s
+        .gsub(
+          /[[:cntrl:]|]/,
+          ' '
+        )
+        .strip
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  exit(
+    Juridico::SmokeAllTribunais.run(
+      ARGV
+    )
+  )
+end

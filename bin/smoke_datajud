@@ -1,0 +1,81 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative '../boot'
+
+module Juridico
+  module SmokeDatajud
+    # Allowlist: mensagens de bibliotecas podem incluir SQL, headers, credenciais
+    # e dados pessoais. Nunca imprimir exception.message, inspect ou backtrace.
+    ERROR_MESSAGES = {
+      'configuration_error' => 'Verifique a configuração das variáveis de ambiente.',
+      'missing_credentials' => 'Credencial de consulta não configurada.',
+      'invalid_cnj' => 'Número CNJ inválido: verifique formato, campos e dígito verificador.',
+      'unsupported_tribunal' => 'Tribunal de origem sem integração pública disponível.',
+      'unsupported_capability' => 'Capacidade não disponibilizada pela fonte oficial.',
+      'not_found' => 'Nenhum registro público encontrado; isso não comprova inexistência.',
+      'non_public_record' => 'Registro sem confirmação de publicidade; consulta rejeitada.',
+      'invalid_response' => 'Resposta da fonte inválida; verifique o contrato do adaptador.',
+      'incomplete_response' => 'A fonte respondeu parcialmente e não foi possível validar o resultado.',
+      'upstream_http_error' => 'A fonte recusou a consulta ou está temporariamente indisponível.',
+      'upstream_timeout' => 'Falha de conexão ou timeout da fonte.',
+      'upstream_tls_error' => 'Não foi possível validar a conexão TLS da fonte.',
+      'rate_limited' => 'Fonte em período de espera; tente novamente mais tarde.',
+      'sync_busy' => 'Já existe uma consulta em andamento para este processo.',
+      'database_error' => 'Operação PostgreSQL falhou; verifique conexão, permissões e migrations.'
+    }.freeze
+
+    def self.run(argv, out: $stdout, err: $stderr)
+      unless argv.length == 1 && !argv.first.strip.empty?
+        err.puts 'Uso: bundle exec ruby bin/smoke_datajud NUMERO_CNJ'
+        return 1
+      end
+
+      repository = nil
+      failure = nil
+      summary = nil
+      begin
+        numero_cnj = argv.first.strip
+        started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        service, repository = Juridico.build_service
+        payload = service.call(ferramenta: 'buscar_processo', numero_cnj: numero_cnj)
+        processos = payload.fetch('processos')
+        summary = {
+          numero_cnj: numero_cnj,
+          tribunal: payload.fetch('origem').fetch('tribunal'),
+          fonte: payload.fetch('capacidades').fetch('fonte'),
+          status: payload.fetch('status'),
+          cache: payload.fetch('cache'),
+          consultado_em: payload.fetch('consultado_em'),
+          processos_encontrados: processos.length,
+          movimentacoes_encontradas: processos.sum { |processo| processo.fetch('movimentacoes').length },
+          duracao_segundos: (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at).round(3)
+        }
+      rescue StandardError => error
+        failure = error
+      ensure
+        begin
+          repository&.close
+        rescue StandardError => error
+          failure ||= error
+        end
+      end
+
+      if failure
+        code = failure.is_a?(Juridico::Error) ? failure.code : nil
+        # Códigos também são limitados para não vazar conteúdo de erros inesperados.
+        safe_code = code && (ERROR_MESSAGES.key?(code) ? code : 'internal_error')
+        err.puts JSON.pretty_generate(
+          status: 'error', error_class: failure.class.name, code: safe_code,
+          message: ERROR_MESSAGES.fetch(safe_code, 'Erro de desenvolvimento durante o smoke test; detalhes potencialmente sensíveis omitidos.')
+        )
+        return 1
+      end
+
+      out.puts JSON.pretty_generate(summary)
+      0
+    end
+  end
+end
+
+exit Juridico::SmokeDatajud.run(ARGV) if $PROGRAM_NAME == __FILE__

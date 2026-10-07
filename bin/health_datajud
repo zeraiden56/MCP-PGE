@@ -1,0 +1,487 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'bundler/setup'
+require 'timeout'
+
+require_relative '../infrastructure/errors'
+require_relative '../infrastructure/config'
+require_relative '../infrastructure/telemetry'
+require_relative '../infrastructure/http_client'
+require_relative '../tribunais/datajud/endpoints'
+
+module Juridico
+  module HealthDatajud
+    class DeadlineExceeded < StandardError; end
+
+    DEFAULT_TIMEOUT_SECONDS = 30.0
+
+    COLUMNS = %i[
+      tribunal
+      status
+      http_status
+      shards_total
+      shards_failed
+      duracao
+    ].freeze
+
+    DOWN_HTTP_STATUSES = [
+      429,
+      502,
+      503,
+      504
+    ].freeze
+
+    DOWN_ERROR_CODES = %w[
+      upstream_timeout
+      upstream_tls_error
+      rate_limited
+      upstream_http_error
+    ].freeze
+
+    #
+    # Tribunais conhecidos pelo projeto que não possuem
+    # endpoint DataJud público homologado.
+    #
+    UNSUPPORTED_TRIBUNALS = %w[
+      STF
+    ].freeze
+
+    def self.run(
+      env: ENV,
+      out: $stdout,
+      err: $stderr
+    )
+      config, deadline =
+        build_health_config(
+          env,
+          err
+        )
+
+      return 2 unless config
+
+      http =
+        HttpClient.new(
+          config: config,
+          telemetry: Telemetry.new(
+            io: err
+          )
+        )
+
+      rows = []
+
+      #
+      # Endpoints efetivamente suportados pelo DataJud.
+      #
+      Tribunais::Datajud::ENDPOINTS.each do |tribunal, url|
+        rows << check_endpoint(
+          tribunal: tribunal,
+          url: url,
+          http: http,
+          deadline: deadline
+        )
+      end
+
+      #
+      # Tribunais conhecidos, mas sem endpoint DataJud.
+      #
+      UNSUPPORTED_TRIBUNALS.each do |tribunal|
+        next if rows.any? do |row|
+          row[:tribunal] == tribunal
+        end
+
+        rows << {
+          tribunal: tribunal,
+          status: 'unsupported',
+          http_status: nil,
+          shards_total: nil,
+          shards_failed: nil,
+          duracao: 0.0
+        }
+      end
+
+      print_table(
+        rows,
+        out
+      )
+
+      #
+      # Exit codes:
+      #
+      # 0 = todos healthy ou unsupported
+      # 1 = houve degraded/down/error
+      # 2 = configuração inválida
+      #
+      unhealthy =
+        rows.any? do |row|
+          %w[
+            degraded
+            down
+            error
+          ].include?(
+            row[:status]
+          )
+        end
+
+      unhealthy ? 1 : 0
+    end
+
+    def self.build_health_config(
+      env,
+      err
+    )
+      deadline =
+        Float(
+          env.fetch(
+            'HEALTH_DATAJUD_TIMEOUT_SECONDS',
+            DEFAULT_TIMEOUT_SECONDS.to_s
+          )
+        )
+
+      unless deadline.finite? &&
+             deadline.positive?
+        raise ArgumentError
+      end
+
+      merged_env =
+        env.to_h.merge(
+          #
+          # Health check nunca deve fazer retry.
+          #
+          'HTTP_MAX_RETRIES' => '0',
+
+          #
+          # O mesmo deadline é aplicado aos timeouts
+          # HTTP do cliente para evitar espera além
+          # do limite do health check.
+          #
+          'HTTP_OPEN_TIMEOUT_SECONDS' =>
+            deadline.to_s,
+
+          'HTTP_READ_TIMEOUT_SECONDS' =>
+            deadline.to_s
+        )
+
+      config =
+        Config.new(
+          merged_env
+        )
+
+      if config.api_key.to_s.empty?
+        raise ArgumentError
+      end
+
+      [
+        config,
+        deadline
+      ]
+
+    rescue ArgumentError,
+           TypeError,
+           Juridico::Error
+      err.puts(
+        'Configuração inválida: verifique DATAJUD_API_KEY e HEALTH_DATAJUD_TIMEOUT_SECONDS.'
+      )
+
+      [
+        nil,
+        nil
+      ]
+    end
+
+    def self.check_endpoint(
+      tribunal:,
+      url:,
+      http:,
+      deadline:
+    )
+      started =
+        monotonic_time
+
+      row = {
+        tribunal: tribunal,
+        status: 'error',
+        http_status: nil,
+        shards_total: nil,
+        shards_failed: nil,
+        duracao: nil
+      }
+
+      begin
+        #
+        # Consulta mínima:
+        #
+        # - zero hits retornados
+        # - sem contagem exata
+        # - sem agregações
+        # - sem paginação
+        # - sem persistência
+        #
+        data, status =
+          Timeout.timeout(
+            deadline,
+            DeadlineExceeded
+          ) do
+            http.post(
+              url: url,
+              tribunal: tribunal,
+              body: {
+                'size' => 0,
+                'track_total_hits' => false,
+                'query' => {
+                  'match_all' => {}
+                }
+              }
+            )
+          end
+
+        row[:http_status] =
+          status
+
+        parse_success_response!(
+          row,
+          data,
+          status
+        )
+
+      rescue DeadlineExceeded
+        row[:status] =
+          'down'
+
+      rescue Juridico::Error => error
+        row[:http_status] =
+          safe_http_status(
+            error
+          )
+
+        row[:status] =
+          status_for_juridico_error(
+            error
+          )
+
+      rescue StandardError
+        #
+        # Não ecoar:
+        #
+        # - mensagens de biblioteca;
+        # - payloads;
+        # - URLs;
+        # - credenciais;
+        # - detalhes de TLS.
+        #
+        row[:status] =
+          'error'
+
+      ensure
+        row[:duracao] =
+          (
+            monotonic_time -
+            started
+          ).round(3)
+      end
+
+      row
+    end
+
+    def self.parse_success_response!(
+      row,
+      data,
+      status
+    )
+      unless status == 200
+        row[:status] =
+          DOWN_HTTP_STATUSES.include?(
+            status
+          ) ? 'down' : 'error'
+
+        return
+      end
+
+      unless data.is_a?(Hash)
+        row[:status] =
+          'error'
+
+        return
+      end
+
+      shards =
+        data['_shards']
+
+      unless shards.is_a?(Hash)
+        row[:status] =
+          'error'
+
+        return
+      end
+
+      total =
+        shards['total']
+
+      failed =
+        shards['failed']
+
+      unless valid_shard_counts?(
+        total,
+        failed
+      )
+        row[:status] =
+          'error'
+
+        return
+      end
+
+      row[:shards_total] =
+        total
+
+      row[:shards_failed] =
+        failed
+
+      row[:status] =
+        failed.zero? ?
+          'healthy' :
+          'degraded'
+    end
+
+    def self.valid_shard_counts?(
+      total,
+      failed
+    )
+      total.is_a?(Integer) &&
+        total >= 0 &&
+        failed.is_a?(Integer) &&
+        failed.between?(
+          0,
+          total
+        )
+    end
+
+    def self.status_for_juridico_error(
+      error
+    )
+      http_status =
+        safe_http_status(
+          error
+        )
+
+      code =
+        error.respond_to?(:code) ?
+          error.code :
+          nil
+
+      if DOWN_HTTP_STATUSES.include?(
+        http_status
+      )
+        'down'
+      elsif DOWN_ERROR_CODES.include?(
+        code
+      )
+        'down'
+      else
+        'error'
+      end
+    end
+
+    def self.safe_http_status(
+      error
+    )
+      return nil unless error.respond_to?(
+        :http_status
+      )
+
+      status =
+        error.http_status
+
+      status.is_a?(Integer) ?
+        status :
+        nil
+    end
+
+    def self.print_table(
+      rows,
+      out
+    )
+      cells =
+        [
+          COLUMNS.map(&:to_s)
+        ] +
+        rows.map do |row|
+          COLUMNS.map do |column|
+            value =
+              row[column]
+
+            value.nil? ?
+              '-' :
+              sanitize_cell(value)
+          end
+        end
+
+      widths =
+        COLUMNS
+          .each_index
+          .map do |index|
+            cells.map do |row|
+              row[index].length
+            end.max
+          end
+
+      out.puts(
+        cells
+          .first
+          .each_with_index
+          .map do |cell, index|
+            cell.ljust(
+              widths[index]
+            )
+          end
+          .join(' | ')
+      )
+
+      out.puts(
+        widths
+          .map do |width|
+            '-' * width
+          end
+          .join('-+-')
+      )
+
+      cells
+        .drop(1)
+        .each do |row|
+          out.puts(
+            row
+              .each_with_index
+              .map do |cell, index|
+                cell.ljust(
+                  widths[index]
+                )
+              end
+              .join(' | ')
+          )
+        end
+    end
+
+    def self.sanitize_cell(
+      value
+    )
+      value
+        .to_s
+        .gsub(
+          /[[:cntrl:]|]/,
+          ' '
+        )
+        .strip
+    end
+
+    def self.monotonic_time
+      Process.clock_gettime(
+        Process::CLOCK_MONOTONIC
+      )
+    end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  exit(
+    Juridico::HealthDatajud.run
+  )
+end
