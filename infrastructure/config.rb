@@ -2,7 +2,8 @@
 module Juridico
   class Config
     attr_reader :ttl, :open_timeout, :read_timeout, :retries, :interval, :max_wait,
-                :user_agent, :api_key, :database_url, :store_raw, :metrics_path
+                :user_agent, :api_key, :database_url, :store_raw, :metrics_path,
+                :pje_enabled, :pje_sso_url, :pje_client_id, :pje_client_secret, :pje_api_base_url, :pje_token_expiry_margin
     def initialize(env = ENV)
       @ttl = number(env, 'CACHE_TTL_SECONDS', 3600, 0)
       @open_timeout = number(env, 'HTTP_OPEN_TIMEOUT_SECONDS', 5, 0.01)
@@ -17,9 +18,18 @@ module Juridico
       @database_url = env['DATABASE_URL']
       @store_raw = env.fetch('STORE_RAW_PAYLOAD', 'false') == 'true'
       @metrics_path = env['METRICS_PATH']
+      @pje_enabled = env.fetch('PJE_ENABLED', 'false') == 'true'
+      @pje_sso_url = env.fetch('PJE_SSO_URL', '').dup.freeze
+      @pje_client_id = env.fetch('PJE_CLIENT_ID', '').dup.freeze
+      @pje_client_secret = env.fetch('PJE_CLIENT_SECRET', '').dup.freeze
+      @pje_api_base_url = env.fetch('PJE_API_BASE_URL', '').dup.freeze
+      @pje_token_expiry_margin = number(env, 'PJE_TOKEN_EXPIRY_MARGIN_SECONDS', 30, 0)
     rescue ArgumentError, TypeError
       raise Error.new('configuration_error', 'Configuração de ambiente inválida.')
     end
+
+    def inspect = '#<Juridico::Config [REDACTED]>'
+    alias to_s inspect
 
     private
 

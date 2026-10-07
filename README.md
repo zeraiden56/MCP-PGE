@@ -323,3 +323,34 @@ habilitado automaticamente.
 Antes de operação, observar as restrições de finalidade e exploração comercial dos
 [termos oficiais DataJud](https://datajud-wiki.cnj.jus.br/api-publica/termo-uso/).
 Alternativas institucionais MNI e datalake permanecem pendentes de contrato e acesso.
+
+## Autenticação PJe (somente camada genérica)
+
+`Tribunais::Pje::Auth::TokenProvider` implementa OAuth2 `client_credentials`, conforme
+https://docs.pje.jus.br/servicos-negociais/servico-sso-pje-kc/.
+Não está conectado às ferramentas MCP nem realiza consulta de processo.
+`PJE_ENABLED=false` é o padrão; `access_token` nesse modo retorna `pje_disabled`
+sem HTTP. Para uso institucional futuro, configurar a URL HTTPS completa de token
+oficialmente autorizada, client_id e client_secret em ambiente seguro.
+`PJE_API_BASE_URL` é reservada, sem uso nesta etapa. Nenhuma URL padrão é inventada.
+
+O provider recebe `config: Juridico::Config.new`, aceita transporte/relógio injetáveis,
+e deve ser reutilizado por cliente institucional. O método `access_token` devolve o
+token; o chamador não deve registrá-lo. Mutex serializa obtenção/renovação. Tokens
+ficam apenas em memória; validade usa relógio monotônico e margem configurável em
+`PJE_TOKEN_EXPIRY_MARGIN_SECONDS` (30 por padrão). Validade menor que a margem
+provoca nova obtenção a cada chamada. Não se utiliza refresh_token nem password grant.
+
+O transporte form-urlencoded é isolado do HttpClient DataJud, cuja política exige
+APIKey e host oficial DataJud. Reutiliza seu tipo Response, exige TLS verificado,
+não usa proxy, não segue redirecionamentos e não faz retries. Usa os timeouts HTTP
+existentes e limite de 64 KiB, exigindo resposta application/json. URL é configuração
+administrativa confiável, jamais entrada de ferramenta MCP. A seleção institucional
+de hosts/ambientes e proteção DNS/SSRF devem ser aprovadas antes de integrar chamadas
+operacionais; esta etapa não cria capabilities, endpoints de processo ou persistência.
+
+Erros: pje_disabled, pje_missing_credentials, pje_authentication_error (401),
+pje_authorization_error (403), pje_timeout, pje_token_error e pje_http_error.
+Mensagens/cadeias de exceção não reproduzem payloads ou credenciais. Config e provider
+redigem inspect/to_s. Os testes usam apenas dados sintéticos/transporte falso:
+`bundle exec rake test`, sem DATABASE_URL e sem internet.

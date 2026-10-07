@@ -4,7 +4,7 @@ require 'json'
 require 'time'
 require 'date'
 %w[infrastructure/errors infrastructure/config infrastructure/telemetry infrastructure/http_client
-   tribunais/cnj tribunais/base_client tribunais/resolver schemas/base schemas/parte schemas/movimentacao
+   tribunais/pje/auth/token_provider tribunais/cnj tribunais/base_client tribunais/resolver schemas/base schemas/parte schemas/movimentacao
    schemas/documento schemas/processo tribunais/datajud/mapper tribunais/datajud/client
    tribunais/trf1/mapper tribunais/trf1/client tribunais/tjmt/mapper tribunais/tjmt/client
    tribunais/stj/mapper tribunais/stj/client tribunais/stf/mapper tribunais/stf/client
