@@ -1,16 +1,14 @@
 # frozen_string_literal: true
+require_relative 'endpoints'
 module Tribunais
   module Datajud
     class Client < BaseClient
-      ENDPOINTS = {
-        'TRF1' => 'https://api-publica.datajud.cnj.jus.br/api_publica_trf1/_search',
-        'TJMT' => 'https://api-publica.datajud.cnj.jus.br/api_publica_tjmt/_search',
-        'STJ' => 'https://api-publica.datajud.cnj.jus.br/api_publica_stj/_search'
-      }.freeze
+      ENDPOINTS = Datajud::ENDPOINTS
       PAGE_SIZE = 100
       MAX_PAGES = 10
-      def initialize(tribunal:, http:, mapper: Mapper.new, clock: -> { Time.now.utc })
+      def initialize(tribunal:, http:, mapper: Mapper.new, clock: -> { Time.now.utc }, telemetry: Juridico::Telemetry.new)
         @tribunal, @http, @mapper, @clock = tribunal, http, mapper, clock
+        @telemetry = telemetry
         @url = ENDPOINTS.fetch(tribunal)
       end
       def capabilities
@@ -27,8 +25,10 @@ module Tribunais
                    'query' => { 'bool' => { 'must' => [{ 'match' => { 'numeroProcesso' => cnj.normalizado } }],
                      'filter' => [{ 'term' => { 'nivelSigilo' => 0 } }] } },
                    'sort' => [{ 'id.keyword' => 'asc' }] }
-          data, _status = @http.post(url: @url, body: body, tribunal: @tribunal)
-          current, count = validate_page(data)
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          data, status = @http.post(url: @url, body: body, tribunal: @tribunal)
+          duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+          current, count = validate_page(data, http_status: status, duration: duration)
           total ||= count
           raise Juridico::Error.new('incomplete_response', 'Índice mudou durante a consulta; sincronize novamente.') if count != total
           pages << data
@@ -61,8 +61,25 @@ module Tribunais
 
       private
 
-      def validate_page(data)
-        unless data.fetch('timed_out') == false && data.fetch('_shards').fetch('failed') == 0
+      def validate_page(data, http_status:, duration:)
+        shards = data.fetch('_shards')
+        failed = shards.fetch('failed')
+        unless failed.is_a?(Integer) && failed >= 0
+          raise Juridico::Error.new('invalid_response', 'Contagem de shards inválida.', http_status: http_status)
+        end
+        if failed.positive?
+          # Não registrar failures/reason, hits ou qualquer conteúdo livre da fonte.
+          counts = %w[total successful failed].to_h do |key|
+            value = shards[key]
+            ["shards_#{key}".to_sym, value.is_a?(Integer) && value >= 0 ? value : nil]
+          end
+          @telemetry.record('datajud_partial_response', tribunal: @tribunal,
+                            http_status: http_status, duracao: duration, **counts)
+          @telemetry.increment('tribunal_errors_total', { tribunal: @tribunal })
+          raise Juridico::Error.new('incomplete_response',
+            'A fonte respondeu parcialmente e não foi possível validar o resultado.', http_status: http_status)
+        end
+        unless data.fetch('timed_out') == false
           raise Juridico::Error.new('incomplete_response', 'Fonte retornou resultado parcial.', http_status: 200)
         end
         result = data.fetch('hits')

@@ -33,7 +33,7 @@ class AdaptersTest < Minitest::Test
     end
   end
   def client_with(data)
-    Tribunais::TRF1::Client.new(http: FakeHTTP.new(data), clock: -> { NOW })
+    Tribunais::TRF1::Client.new(http: FakeHTTP.new(data), clock: -> { NOW }, telemetry: telemetry)
   end
   def test_sigilo_and_unknown_sigilo_are_rejected
     [1, '0', nil].each do |level|

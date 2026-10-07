@@ -64,6 +64,96 @@ com diretório de trabalho na raiz do projeto e as variáveis de ambiente acima.
 Não distribua configurações contendo segredos. MCP remoto com autenticação não
 foi implementado; o acesso nesta versão é controlado pelo host e usuário local.
 
+## Smoke test DataJud sem MCP
+
+Com as variáveis de ambiente já carregadas:
+
+```bash
+bundle exec ruby bin/smoke_datajud NUMERO_CNJ
+# Forçar consulta real mesmo havendo cache válido:
+CACHE_TTL_SECONDS=0 bundle exec ruby bin/smoke_datajud NUMERO_CNJ
+```
+
+O script chama `Juridico.build_service`, a mesma composição utilizada por
+`Juridico.build` para o MCP, e executa `ProcessoSync.call` diretamente. Não cria
+servidor, contexto ou resposta MCP. Consulta a fonte real em cache miss e persiste
+normalmente no `DATABASE_URL`; cache hit mantém a data da consulta anterior.
+
+O stdout contém somente resumo JSON: CNJ, tribunal, fonte, status, cache,
+`consultado_em`, quantidade de capas, movimentos somados entre todas as capas e
+duração (incluindo composição e consulta, em segundos). Movimentos são contados por
+capa, sem deduplicação entre graus. Não imprime payload nem dados de partes.
+Erros saem no stderr com classe, código de domínio quando disponível e mensagem
+segura por allowlist; mensagens brutas de exceções são omitidas porque podem incluir
+SQL, credenciais ou dados pessoais. Erros encerram com código 1 e a conexão é fechada.
+Esse comando é uma consulta operacional real, separada dos testes com mocks.
+
+## Matriz de smoke tests
+
+```bash
+TRF1_CNJ='...' TJMT_CNJ='...' STJ_CNJ='...' STF_CNJ='...' \
+  bundle exec ruby bin/smoke_all_tribunais
+
+# Alternativa: argumentos identificados, que prevalecem sobre o ambiente.
+bundle exec ruby bin/smoke_all_tribunais TRF1_CNJ='...' TJMT_CNJ='...'
+```
+
+Substitua os exemplos por CNJs completos. O script usa as origens registradas no
+`TribunalResolver`, uma única composição `Juridico.build_service` e chamadas diretas
+ao mesmo serviço de `bin/smoke_datajud`, sequencialmente. Não adiciona retries;
+preserva os limites do cliente, o cache e a persistência normal. Para garantir
+consulta externa nas origens suportadas, use `CACHE_TTL_SECONDS=0`.
+
+A tabela final contém tribunal, CNJ, status, código de erro, fonte, cache,
+`consultado_em`, número de capas, movimentos somados entre capas e duração por
+consulta (sem incluir a composição inicial). Erros não interrompem as demais linhas;
+`not_found`, `incomplete_response`, `upstream_timeout`, `upstream_http_error` e
+`unsupported_tribunal` aparecem como códigos distintos. STF permanece unsupported.
+Respostas parciais não são persistidas; apenas a tentativa é auditada como erro.
+
+CNJs ausentes geram `skipped / missing_cnj`. A origem é validada pelo resolver;
+um CNJ de outra origem gera `tribunal_mismatch` sem consultar a fonte. Entradas
+inválidas não são ecoadas. Em erros, campos sem resultado validado ficam como `-`,
+inclusive cache e contagens: não representam zero resultados ou cache miss confirmado.
+Falha na composição inicial é informada em todas as entradas fornecidas.
+Mensagens brutas de exceções e payloads nunca entram no resumo.
+
+Códigos de saída: 0 quando todas as consultas fornecidas têm sucesso; 1 quando
+alguma falha (inclusive STF unsupported) ou ocorre erro no fechamento da conexão;
+2 para argumentos inválidos ou nenhuma entrada. A conexão é fechada ao final.
+Assim como os demais executáveis, o script não carrega `.env` automaticamente.
+
+## Saúde dos índices DataJud
+
+```bash
+HEALTH_DATAJUD_TIMEOUT_SECONDS=10 bundle exec ruby bin/health_datajud
+```
+
+Requer a chave DataJud no ambiente, mas não requer `DATABASE_URL`. Não carrega
+`boot.rb`, MCP, repositório ou serviço de sincronização. Reutiliza o transporte HTTP
+e o registro de endpoints para sondar TRF1, TJMT e STJ sequencialmente, sem gravar
+dados. Cada POST usa `size: 0`, `track_total_hits: false` e `match_all`, sem hits,
+agregações ou paginação. Não imprime chave ou payload.
+
+`HEALTH_DATAJUD_TIMEOUT_SECONDS` (padrão 10) limita o tempo total de cada sondagem,
+incluindo eventual espera do limitador, e configura os timeouts de conexão/leitura.
+Retries ficam obrigatoriamente em zero, independentemente de `HTTP_MAX_RETRIES`.
+O transporte continua respeitando o limitador e cooldown de `Retry-After`; um
+cooldown pode impedir o envio de sondagens posteriores, sem tentar contorná-lo.
+
+A tabela mostra `tribunal | status | http_status | shards_total | shards_failed | duracao`:
+
+- `healthy`: HTTP 200 e nenhum shard falho.
+- `degraded`: HTTP 200 e um ou mais shards falhos.
+- `down`: 429, 502, 503, 504, timeout, erro de conexão/TLS ou cooldown impeditivo.
+- `error`: resposta inválida ou outro HTTP, incluindo 401/403; não comprova queda do índice.
+
+Campos desconhecidos aparecem como `-`; duração em segundos. Exit code 0 significa
+todos healthy, 1 indica alguma sondagem não saudável e 2 configuração inválida.
+Uma consulta mínima saudável não garante que consultas processuais mais complexas
+estejam saudáveis nem que os dados estejam completos ou atualizados.
+As variáveis devem estar exportadas; `.env` não é carregado automaticamente.
+
 ## Ferramentas MCP
 
 Todas recebem somente `{ "numero_cnj": "0000832-35.2018.4.01.3202" }`, ou número
@@ -187,6 +277,15 @@ Respostas têm limite local de 10 MiB. Não há circuit breaker adicional: retri
 limitados e respostas com Retry-After estabelecem cooldown entre chamadas. Em múltiplas
 réplicas o limitador HTTP é local; antes de escalar, implementar coordenação central
 para a quota compartilhada da chave.
+
+HTTP 200 com `_shards.failed > 0` gera `incomplete_response`, com a mensagem
+“A fonte respondeu parcialmente e não foi possível validar o resultado.”, antes de
+interpretar hits (mesmo vazios). Não há retry automático para respostas 200 parciais;
+nenhuma capa/payload parcial é persistida e o TTL não é renovado. A tentativa de
+sincronização é auditada como erro. O evento `datajud_partial_response` registra
+somente tribunal, HTTP status, contagens total/successful/failed de shards e duração,
+sem motivos livres de falha, payload ou credenciais. Os logs HTTP indicam apenas o
+resultado do transporte; a aceitação dos dados depende da validação do cliente.
 
 Logs contêm tribunal, ferramenta, duração em segundos, status, cache hit/miss e HTTP
 status. Não registram tokens, parâmetros, CPF, payload, SQL ou URL do banco.

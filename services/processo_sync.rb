@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 module Services
   class ProcessoSync
+    attr_reader :resolver
     OPERATIONS = { 'buscar_processo' => 'processo', 'buscar_movimentacoes' => 'movimentacoes',
                    'buscar_documentos' => 'documentos', 'sincronizar_processo' => 'processo' }.freeze
     def initialize(resolver:, repository:, cache:, telemetry:)

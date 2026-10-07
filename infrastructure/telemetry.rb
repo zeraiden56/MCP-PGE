@@ -3,7 +3,7 @@ require 'json'
 require 'thread'
 module Juridico
   class Telemetry
-    ALLOWED = %i[tribunal ferramenta duracao status cache http_status].freeze
+    ALLOWED = %i[tribunal ferramenta duracao status cache http_status shards_total shards_successful shards_failed].freeze
     def initialize(io: $stderr, metrics_path: nil)
       @io, @path, @metrics, @mutex = io, metrics_path, Hash.new(0), Mutex.new
     end

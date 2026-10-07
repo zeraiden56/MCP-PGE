@@ -13,16 +13,21 @@ require 'date'
    mcp/tools/buscar_documentos mcp/tools/sincronizar_processo mcp/server].each { |file| require_relative file }
 module Juridico
   def self.build(config: Config.new)
+    service, repo = build_service(config: config)
+    [server(service: service), repo]
+  end
+
+  def self.build_service(config: Config.new)
     unless config.database_url && !config.database_url.empty?
       raise Error.new('configuration_error', 'Configure DATABASE_URL.')
     end
     telemetry = Telemetry.new(metrics_path: config.metrics_path)
     http = HttpClient.new(config: config, telemetry: telemetry)
-    clients = { 'TRF1' => Tribunais::TRF1::Client.new(http: http), 'TJMT' => Tribunais::TJMT::Client.new(http: http),
-                'STJ' => Tribunais::STJ::Client.new(http: http), 'STF' => Tribunais::STF::Client.new }
+    clients = { 'TRF1' => Tribunais::TRF1::Client.new(http: http, telemetry: telemetry), 'TJMT' => Tribunais::TJMT::Client.new(http: http, telemetry: telemetry),
+                'STJ' => Tribunais::STJ::Client.new(http: http, telemetry: telemetry), 'STF' => Tribunais::STF::Client.new }
     repo = Repositories::ProcessoRepository.new(database_url: config.database_url, store_raw: config.store_raw)
     service = Services::ProcessoSync.new(resolver: Tribunais::TribunalResolver.new(clients), repository: repo,
       cache: Services::CacheService.new(ttl: config.ttl), telemetry: telemetry)
-    [server(service: service), repo]
+    [service, repo]
   end
 end
