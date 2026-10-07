@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+.bundle/
+vendor/
+tmp/
+coverage/
+*.log

@@ -1,0 +1,14 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+require 'bundler/setup'
+require_relative '../db/migrate'
+begin
+  conn = PG.connect(ENV.fetch('DATABASE_URL'), connect_timeout: 5)
+  Database.migrate(conn)
+  puts 'Migrations aplicadas.'
+rescue StandardError
+  warn 'Falha na migration. Verifique conexão, permissões e integridade das migrations; credenciais omitidas.'
+  exit 1
+ensure
+  conn&.close
+end

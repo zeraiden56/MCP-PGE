@@ -1,0 +1,58 @@
+{
+  "timed_out": false,
+  "_shards": {
+    "failed": 0
+  },
+  "hits": {
+    "total": {
+      "value": 1,
+      "relation": "eq"
+    },
+    "hits": [
+      {
+        "_id": "TJMT_7_G1_100_00000019120268110001",
+        "_source": {
+          "id": "TJMT_7_G1_100_00000019120268110001",
+          "numeroProcesso": "00000019120268110001",
+          "tribunal": "TJMT",
+          "nivelSigilo": 0,
+          "grau": "G1",
+          "classe": {
+            "codigo": 7,
+            "nome": "Procedimento sintético"
+          },
+          "sistema": {
+            "nome": "PJe"
+          },
+          "orgaoJulgador": {
+            "codigo": 100,
+            "nome": "Unidade fictícia"
+          },
+          "assuntos": [
+            {
+              "codigo": 1,
+              "nome": "Assunto fictício"
+            }
+          ],
+          "dataAjuizamento": "20260102120000",
+          "dataHoraUltimaAtualizacao": "2026-10-01T10:00:00Z",
+          "movimentos": [
+            {
+              "codigo": 26,
+              "nome": "Distribuição fictícia",
+              "dataHora": "2026-01-02T12:00:00Z",
+              "complementosTabelados": [
+                {
+                  "codigo": 1,
+                  "valor": 2,
+                  "nome": "Sorteio",
+                  "descricao": "Tipo"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
